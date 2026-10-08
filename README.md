@@ -1,275 +1,53 @@
-# Connecting Claude to ServiceNow over MCP
+# Claude + ServiceNow at an IT service desk
 
-A field guide to wiring claude.ai to a ServiceNow instance through ServiceNow's
-native MCP (Model Context Protocol) Server, with OAuth delegated per user, so
-Claude can read and update tickets as the signed-in analyst and every action
-lands in the ServiceNow audit trail under that person's name.
+What I built, what broke, and what it produced when I connected Claude to a
+production ServiceNow instance for an enterprise IT service desk in September
+2026. Nobody at the company had connected an AI tool to the instance before,
+and I did not have a platform team behind me. I had the ServiceNow SDK, a dev
+clone, Claude Code, and a rule that nothing touches production without a
+rehearsal and a read-back.
 
-This is a sanitized version of the runbook I wrote and used to stand this up on
-a production ServiceNow instance (Zurich release) in September 2026. Instance
-names, people, ticket numbers and internal references are removed. Everything
-else is as built.
+This repo is the sanitized record: the narrative, the two core helper scripts
+as they actually ran, the guardrails, the numbers, and the runbook for the
+second integration path (ServiceNow's native MCP Server connected to
+claude.ai). Company name, instance names, people and ticket numbers are
+removed. Everything else is as it happened.
 
 ```
-claude.ai  --OAuth (Authorization Code, JWT)-->  ServiceNow Application Registry
-claude.ai  --MCP over HTTPS------------------->  /sncapps/mcp-server/mcp/<server>
-                                                 └─ tools: get/update incident, get/update catalog task ...
+Phase 1  Claude Code  --ServiceNow SDK (now-sdk, OAuth per user)-->  Table API    [built, used daily]
+Phase 2  claude.ai    --MCP connector (OAuth, JWT, useraccount)--->  MCP Server   [designed, runbook written]
 ```
 
-## Why this design
-
-- **No shared service account.** Each user authorizes Claude against their own
-  ServiceNow login. The token carries their roles and nothing more, and the
-  audit log says who did what.
-- **ServiceNow decides what Claude can call.** The MCP server exposes an
-  explicit tool list. Claude never sees a raw Table API.
-- **Prove the pipe before building on it.** Connect the plugin's read-only
-  Quickstart server first, then build the real tool set.
-- **Verify in the record, not in the chat.** Claude's "done" is a claim. The
-  work note on the ticket is the evidence.
-
-## Prerequisites
-
-| Requirement | Notes |
+| | |
 |---|---|
-| ServiceNow Zurich Patch 4 or later | Earlier releases do not ship the MCP Server app |
-| Now Assist licensing (Pro Plus / Enterprise Plus) or an AI SKU | The MCP Server app is not part of base ITSM. If it does not appear under All Available Applications, that is a licensing question for your account team, not a permissions problem |
-| `Now Assist Admin Console` (sn_nowassist_admin) installed | Dependency of the MCP server app |
-| `Model Context Protocol Server` (sn_mcp_server) installed | Provides the MCP Server Console, the Quickstart server, and the `/sncapps/mcp-server/` endpoints |
-| A ServiceNow account with `admin`, or `sn_mcp_server.admin` plus rights to create Application Registry records | Needed once, for setup |
-| A claude.ai plan that supports custom connectors | Pro, Max, Team or Enterprise |
+| **Phase 1 code** | [`tools/snow-table-query.js`](tools/snow-table-query.js) (read-only) and [`tools/snow-table-write.js`](tools/snow-table-write.js) (guarded writes) |
+| **Phase 2 runbook** | [`docs/mcp-connector-guide.md`](docs/mcp-connector-guide.md) |
+| **Stack** | ServiceNow Zurich, `@servicenow/sdk` 4.11, Node 24, Claude Code on Windows 11, PowerShell 7 |
 
-## Quick reference: what the Claude connect form needs
+## The problem
 
-The ServiceNow entry in the claude.ai Connectors Directory asks for three
-values. All three are produced on the ServiceNow side first.
+A service desk runs on ServiceNow, but the evidence for whether a ticket was
+actually done right lives in four other places: Entra ID, Exchange Online,
+on-prem Active Directory, and Intune. Checking one offboarding by hand meant
+twenty browser tabs. Checking thirty of them never happened. The asset table
+had not been reconciled against the endpoint-management inventory in years.
+And the change-management conflict flag fired on every single change, so
+everyone had learned to ignore it.
 
-| Claude form field | Value | Where it comes from |
-|---|---|---|
-| Server URL | `https://<instance>.service-now.com/sncapps/mcp-server/mcp/<server-name>` | MCP Server Console > Servers > open the server > Server URL field (Step 2) |
-| OAuth Client ID | 32 hex characters, auto generated | Application Registry record (Step 1) |
-| OAuth Client Secret | auto generated, revealed with the lock icon | Same record (Step 1) |
+I had been using Claude Code for scripting. The question was whether it could
+reach ServiceNow safely enough to do this work for real, under my own login,
+with every action attributable to me, and without a single credential typed
+into a chat window.
 
-Values that must be exact on the ServiceNow side:
+## Phase 1: ServiceNow SDK with per-user OAuth
 
-| Setting | Required value | What happens if it is wrong |
-|---|---|---|
-| Redirect URL | `https://claude.ai/api/mcp/auth_callback` (optionally also `https://claude.com/api/mcp/auth_callback`, comma separated). No trailing slash. | OAuth page errors or loops back to the form |
-| Token Format | `JWT` | Default is Opaque. It connects, then exposes zero tools |
-| Grant type | Authorization Code | Record created as Resource Owner Password Credentials never shows a consent screen |
-| Auth Scope | `useraccount` | Token has no API access |
-| Client Type | Confidential (default) | |
+### How it works
 
-## Bookmarks
-
-Every URL used in this setup, with `<instance>` as the placeholder.
-
-| Purpose | URL or path |
-|---|---|
-| MCP server health check | `https://<instance>.service-now.com/sncapps/mcp-server/health` |
-| MCP service records (sys_service) | `/nav_to.do?uri=sys_service_list.do%3Fsysparm_query%3DnameLIKEmcp` |
-| All Available Applications (app install) | `/nav_to.do?uri=%24allappsmgmt.do` |
-| Application Registry list (classic UI) | `/nav_to.do?uri=oauth_entity_list.do` |
-| Inbound Integrations (Machine Identity Console, new UI) | `/now/machine-identity-console/inbound-integrations/welcome` |
-| Inbound API Integration Usage dashboard | Banner link on the Inbound Integrations page |
-| MCP Server Console | Filter Navigator: type `MCP Server Console` (under Admin Center) |
-| Claude connector directory entry | https://claude.ai/directory/connectors/servicenow/connect |
-| Claude connector settings | claude.ai > Customize > Connectors |
-| ServiceNow Developer Advocate walkthrough (Sep 2026) | https://www.servicenow.com/community/developer-advocate-blog/building-an-mcp-server-on-servicenow-and-connecting-claude-to-it/ba-p/3588171 |
-| ServiceNow HRSD MCP client tutorial (redirect URL, JWT, useraccount) | https://www.servicenow.com/community/servicenow-otto-articles/quick-tutorial-mcp-client-to-servicenow-hrsd-mcp-server/ta-p/3589606 |
-
-## Step 0: verify the MCP Server app is installed and healthy
-
-Do this before touching OAuth. If the app is not there, nothing else in this
-guide works.
-
-1. Open `https://<instance>.service-now.com/sncapps/mcp-server/health`.
-   Expected: `{"status":"healthy"}`. A 404 or an HTML error page means the app
-   is not installed.
-2. Open the sys_service list filtered on `mcp`. Expected: two records,
-   `MCP-S` and `mcp-server`. Open `mcp-server` and confirm the Service
-   Endpoints related list has a record with Active = true.
-3. Filter Navigator: type `MCP Server Console`. Expected: it appears under
-   Admin Center and opens with Servers and Tools tabs.
-
-If any of the three fail, install the app:
-
-1. Open All Available Applications.
-2. Search `Now Assist Admin Console` (sn_nowassist_admin). Install it first if
-   it is not already installed.
-3. Search `Model Context Protocol Server` (sn_mcp_server). Install.
-4. Re-run the health URL.
-
-## Step 1: create the OAuth Application Registry record
-
-This produces the Client ID and Client Secret. Two UIs exist on Zurich; either
-works. The classic list is the one the reference walkthrough was verified on.
-
-Where: `/nav_to.do?uri=oauth_entity_list.do`
-
-1. Click **New** next to Application Registries.
-2. On the interceptor page choose **Create an OAuth API endpoint for external
-   clients**. On Zurich it may be labeled "[Deprecated UI] Create an OAuth API
-   endpoint for external clients". That is still the correct choice.
-3. Fill in the form:
-
-   | Field | Value |
-   |---|---|
-   | Name | `Claude MCP Connector` |
-   | Client ID | leave blank, auto generates on save |
-   | Client Secret | leave blank, auto generates on save |
-   | Redirect URL | `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback` |
-   | Token Format | `JWT` |
-   | Client Type | Confidential (default) |
-   | Refresh Token Lifespan | leave default (8,640,000 seconds, 100 days) |
-   | Access Token Lifespan | leave default (1,800 seconds) |
-   | Comments | who created it, when, and what it is for |
-
-4. Scroll to the **Auth Scopes** embedded list at the bottom. Double click
-   "Insert a new row", type `useraccount`, press Enter.
-5. Right click the form header and choose **Save** (not Submit) so the form
-   stays open.
-6. Copy the **Client ID**.
-7. Click the lock icon next to **Client Secret** to reveal it. Copy it
-   somewhere temporary. It gets pasted into Claude within minutes and then
-   belongs in your team's password vault, labeled with the registry record
-   name. Never write it into a document.
-
-Alternative path, same result: Inbound Integrations (Machine Identity Console)
-> **New integration** > grant type Authorization Code > same field values. The
-new UI shows the grant type as a column, which is a quick way to confirm the
-record landed as Authorization Code and not Resource Owner Password
-Credentials.
-
-## Step 2: pick or create the MCP server and copy its Server URL
-
-The Server URL is `https://<instance>.service-now.com/sncapps/mcp-server/mcp/`
-plus the name segment of a specific MCP server record. That segment does not
-exist until a server record exists.
-
-Where: Filter Navigator > `MCP Server Console`.
-
-### Fast path: prove the pipe first
-
-1. **Servers** tab.
-2. Open **Quickstart Server**. It ships with the app and carries four read-only
-   tools: look up incident, look up case, summarize incident, summarize case.
-3. Confirm it shows **Deactivate** (meaning it is active). If it shows
-   **Activate**, click it.
-4. Copy the **Server URL** field. That is the Claude Server URL.
-
-### Real path: the service desk tool set
-
-Do this after the Quickstart connection works end to end.
-
-1. **Tools** tab > **Create Tool** > choose a category. For reading and
-   updating tasks, the two candidates are the REST API tool (Scripted REST or
-   Table API endpoint) and the Table tool. Each tool needs a Label, a
-   Description written for the model (what it does, then when to call it), and
-   its inputs.
-2. A minimum tool set for a service desk workflow:
-
-   | Tool | Shape |
-   |---|---|
-   | Get Catalog Task | GET `sc_task` by number. Returns state, assigned_to, short_description, description, variables |
-   | Update Catalog Task | PATCH `sc_task` by number. Accepts work_notes, comments, state, assigned_to, close_notes |
-   | Get Incident | GET `incident` by number, same fields |
-   | Update Incident | PATCH `incident` by number, same inputs |
-
-3. **Servers** tab > **Create Server** > give it a label > **Add Tools** >
-   select the tools > **Create** > **Activate**.
-4. Copy that server's **Server URL**. Either repoint the existing Claude
-   connection at it, or add it as a second connector.
-
-Role required to create tools: `sn_mcp_server.tools_admin`,
-`sn_mcp_server.admin`, or `admin`. Every server needs at least one tool before
-it can be activated, so tools come before servers.
-
-## Step 3: fill in the Claude connect form and authorize
-
-Where: claude.ai > Customize > Connectors > Browse connectors > ServiceNow, or
-directly https://claude.ai/directory/connectors/servicenow/connect.
-
-1. Server URL: paste from Step 2.
-2. OAuth Client ID: paste from Step 1.
-3. OAuth Client Secret: paste from Step 1.
-4. Click **Connect**.
-5. You are redirected to your ServiceNow instance. If it bounces through your
-   identity provider's SSO first (Entra ID, Okta, and so on), that is normal.
-   Sign in as yourself.
-6. ServiceNow consent screen: "Connect your ServiceNow account to Claude MCP
-   Connector" with scope `useraccount`. Click **Allow**.
-7. You land back in claude.ai with the connector showing Connected.
-8. In a chat, click **+** > **Connectors** and make sure the ServiceNow toggle
-   is on for that conversation.
-
-The consent screen is the control point. ServiceNow is not handing Claude a
-blanket key. You are approving one registered application for one scope under
-your own login. Anything Claude does through it shows up in ServiceNow audit
-as you.
-
-## Step 4: test read and write, then verify in ServiceNow
-
-Where: a new claude.ai chat with the ServiceNow connector toggled on.
-
-1. **Read test.** Prompt: `Get the details of ServiceNow incident INC0000001.`
-   Claude asks permission to run the tool the first time. Allow it. Expect
-   number, short description, state, assigned to, opened date.
-2. **Write test.** Only once your own server with an update tool exists; the
-   Quickstart server is read-only. Prompt:
-   `Add a work note to SCTASK0000001 that says "Claude connector test, ignore."`
-3. Open the record in ServiceNow and confirm the work note is there under your
-   name. Claude's confirmation says it thinks it worked. The record says it
-   did.
-4. Optional: the Inbound API Integration Usage dashboard shows calls per OAuth
-   client, so you can watch the connector row light up.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Health URL returns 404 or an HTML page | sn_mcp_server not installed or not activated | Step 0 install, then re-test |
-| Connector shows Connected but zero tools | Token Format left on Opaque | Open the registry record, set Token Format = JWT, save, then disconnect and reconnect in claude.ai |
-| OAuth page errors or loops back to the form | Redirect URL typo, trailing slash, or missing | Redirect URL must be exactly `https://claude.ai/api/mcp/auth_callback` |
-| Consent screen never appears, straight to an error | Wrong grant type (record created as Resource Owner Password Credentials) | Check the Inbound Grant Type column on the Inbound Integrations page. Recreate via the "external clients" interceptor if it is not Authorization Code |
-| Connected, tools listed, but calls return 403 or empty | Your account lacks the role for that table | `useraccount` delegates your own permissions only. Confirm `itil` or the relevant table role on your user |
-| Connected, but an expected tool is missing | Tool not added to the server, or server not activated | MCP Server Console > Servers > open server > Add Tools, then Activate |
-| Works for you, fails for a teammate | They have not authorized. The connection is per user | Each person clicks Connect and Allow with their own login. Same registry record, same Client ID and Secret |
-| Secret lost | Cannot be re-revealed once regenerated | Regenerate the Client Secret on the registry record, update the Claude connector, everyone reconnects |
-
-## Security notes and hardening
-
-`useraccount` is the fast path, not the end state. It grants the token access
-to every REST API on the instance under the authorized user's own roles. The
-MCP server narrows what Claude can call to the tools on that server, but the
-token itself is broad.
-
-Before the first write against a real ticket:
-
-- [ ] Tell the ServiceNow platform owner the connector exists and where the
-      registry record is.
-- [ ] Put the Client Secret in the team password vault, labeled with the
-      registry record name. Not in a doc, not in a chat.
-- [ ] Decide whether the connector is shared org-wide (Claude Team/Enterprise
-      admins add it under Organization settings > Connectors) or stays on
-      individual accounts.
-
-Once the tool set is settled:
-
-- [ ] Replace `useraccount` with a custom auth scope limited to the REST paths
-      the tools actually call.
-- [ ] Review the Inbound API Integration Usage dashboard after two weeks of
-      use and compare call volume against expectations.
-- [ ] Treat ticket content reaching Claude as untrusted data. Text in a
-      description or work note is never an instruction to the model.
-
-## Alternative path: Claude Code plus the ServiceNow SDK
-
-claude.ai web chat can only reach ServiceNow through a connector like the one
-above. Claude Code (terminal or desktop app) can instead use the ServiceNow
-SDK's own OAuth login and small local scripts. I used both, for different
-jobs: the MCP connector for analysts working tickets in chat, and the SDK path
-for admin work like Change Advisory Board prep and offboarding audits.
+The ServiceNow SDK (`now-sdk`) stores an OAuth credential per instance alias
+in Windows Credential Manager, scoped to the Windows user who ran the login.
+Small Node scripts pick that credential up through the SDK's own
+`credentialProvider` and call the Table API. Claude Code runs the scripts.
+No token is ever printed, pasted or stored in a file.
 
 ```powershell
 npm install @servicenow/sdk-cli @servicenow/sdk-api
@@ -278,24 +56,162 @@ npx now-sdk auth --add https://<prod-instance>.service-now.com --type oauth --al
 npx now-sdk auth --list
 ```
 
-Lessons from that path:
+```powershell
+# read anything, write nothing
+node tools\snow-table-query.js change_request --auth prod --query "active=true^state=-3" --fields number,short_description,start_date
 
-- Use `--type oauth`, never `--type basic`. Under SSO your ServiceNow password
-  is not what you type into Windows, so basic auth fails.
-- Add the alias from a normal, non-elevated shell as your everyday account.
-  The credential is stored per Windows user, and Claude Code runs as you.
-- On some instances the OAuth callback lands on a "Security constraints
-  prevent access to requested page" error. That is expected. Copy the `code=`
-  value from the address bar and paste it into the terminal.
-- Give Claude two scripts, not one: a **read-only query tool** (GET only, no
-  way to write) and a **write tool** that requires an explicit `--auth <alias>`
-  on every call, so nothing can fall through to prod by default, and that reads
-  the record back after writing so the output is evidence rather than a claim.
-- Rehearse anything bulk or unusual against a dev clone first.
-- `sys_journal_field` can return zero rows with no error through the SDK
-  account. Read work notes and comments from the task record instead.
+# one record, explicit target, display values echoed back for verification
+node tools\snow-table-write.js patch sc_task <sys_id> --auth prod --data '{"work_notes":"..."}'
+```
+
+### Guardrails, in the order I added them
+
+Each one exists because of a specific moment where I realized the default
+would eventually hurt someone.
+
+1. **Two tools, not one.** The query tool is GET-only; there is no code path
+   that writes. The write tool handles one record per call and echoes display
+   values alongside raw values, so the output is the verification.
+2. **`--auth` is required on every call, with no default alias.** The SDK
+   happily falls back to a default credential. That is how a "quick check"
+   becomes an accidental prod write. Removing the fallback made every call
+   name its target.
+3. **Dev first for anything bulk, novel, or hard to reverse.** The dev
+   instance was a two-month-old clone of prod: same structure, stale data.
+   Good enough to rehearse shape and volume.
+4. **Dry run before apply.** The larger scripts (asset reconciliation,
+   offboarding audit) default to a report. Applying needs an explicit flag,
+   and a prod apply needs a second explicit confirmation flag.
+5. **Guarded delete.** Deletes are limited to an allow-list of link tables
+   (role assignments, group memberships, knowledge access rows), never
+   business records. The sys_id must be repeated in `--confirm`. The record is
+   read and snapshotted to a local JSONL log before the DELETE, so it can be
+   re-POSTed. A read-after-delete must return 404 or the exit code is 1. A
+   bypass flag for full deletes exists for dev and is silently ignored on any
+   prod alias.
+6. **Read back after every write.** Claude saying "done" is a claim. The
+   record is the evidence. Every write tool re-reads the record and prints
+   it.
+7. **Never type a password into Claude.** The OAuth browser flow is the only
+   place it belongs. The SDK's basic-auth mode is never used.
+
+### What broke, and what I learned
+
+- **Basic auth failed immediately.** The company logged into ServiceNow
+  through Entra ID SSO, so there was no ServiceNow password to type. Fix:
+  `--type oauth`, always.
+- **The prod OAuth callback landed on an error page.** "Security constraints
+  prevent access to requested page." Dev showed the one-time code normally;
+  prod blocked the page. The code was still in the address bar. Copy the
+  `code=` value, paste it into the terminal, done. Not a permissions problem,
+  just a quirk worth writing down because it looks like a hard failure.
+- **Credentials vanished when I ran the login elevated.** Windows Credential
+  Manager is per user. An elevated shell stored the credential under the admin
+  account, where Claude Code, running as my everyday account, could not see
+  it. Fix: never log in from an elevated shell. Output files landed in the
+  wrong profile's Downloads for the same reason, so the tools now anchor
+  everything under a dated workbench folder in the repo.
+- **`sys_journal_field` returned zero rows and no error.** Work notes and
+  comments were simply invisible through the SDK account. Fix: read the
+  concatenated `work_notes` and `comments` fields from the task record and
+  split on the journal header pattern. Cost me an evening and an audit whose
+  first pass showed zero documentation for a technician who had written
+  plenty, because his notes were in Additional Comments rather than Work
+  Notes.
+- **You only see what your roles see.** ACLs hid several tables from an
+  itil-level account with no error, just empty results. The SDK is not a
+  bypass. Had to confirm visibility per table before trusting an empty
+  answer.
+- **Granting myself the SDK roles was itself a finding.** I added
+  `oauth_admin`, `rest_api_explorer` and the SDK admin roles to my own prod
+  account, and nothing alerted anyone. Role-grant alerting was not routed. I
+  flagged it, documented it in the offboarding playbook, and later recommended
+  removing the redundant self-granted roles.
+- **UTC bit me twice.** Requested-date fields are stored UTC and displayed
+  local. An output folder got the wrong date because the stamp used UTC. All
+  day-level math now uses display values consistently.
+- **A security alert fired on my own tooling.** The MSSP's EDR flagged
+  `cmdkey /list` spawned from PowerShell as credential reconnaissance. Traced
+  it: a different AI coding tool, not Claude Code, was enumerating stored
+  credentials. Worth knowing that AI agents on an endpoint look like attackers
+  to a SIEM until you explain them.
+- **Token refresh just worked.** "Access Token has expired, refreshing token"
+  in a log, and the query continued. One less thing.
+
+### What it produced
+
+| Job | Date | Result |
+|---|---|---|
+| **Endpoint-inventory to asset reconciliation** | 2026-09-12 | 860 managed-device serials compared against 1,078 asset records. Two dry runs, then one applied run to prod: 52 hardware records created and verified (7 of them also retiring a stale import row), 8 serials corrected, 3 assets un-retired, 37 state fixes. 34 potential creates and 18 state fixes were deliberately left as decision rows for a human, because the script could not tell a BYOD device from a missing record. First reconciliation in years. |
+| **Offboarding audit, 30 days, whole team** | 2026-09-15 | 24 requests, 48 tasks and 7 orphan tasks pulled from prod in about one minute. Merged with Entra, Exchange and AD evidence (collected by separate read-only PowerShell, two device-code sign-ins, one mailbox-fleet walk across about 1,300 mailboxes) into a severity-weighted scorecard per user and per technician. Found one former employee still enabled and licensed two weeks after exit, a team-wide habit of skipping the AD password reset, and a directory job that was silently overwriting the audit stamp the playbook relied on. |
+| **Change management hygiene** | 2026-09-15 | 20 active changes analysed. The conflict flag was 100 percent noise because a global maintenance window had expired. Underneath it: 8 real blackout conflicts. Five floating US holidays were pinned to 2012 dates. The CAB definition had never generated a meeting. Built a CAB-prep report and a 60-minute setup kit so the change manager could run it herself. |
+| **Role and access audits** | 2026-09-19 to 09-21 | Team role-comparison workbook, approval-automation recon (about 35,000 approval records, 3,000 in the trailing 90 days), and a role request to build scoped apps with Fluent from source control. |
+| **Daily use** | ongoing | Own-queue triage, person timelines across tickets, text search across journals, hardware-recovery emails generated from live task data, attachments posted to tasks. Fourteen helper scripts in all. |
+
+Only the two generic tools are in this repo. The other twelve are built on the
+same two primitives but are shaped around one company's catalog items,
+variables and playbook, so they do not sanitize cleanly.
+
+## Phase 2: ServiceNow's native MCP Server and claude.ai
+
+The SDK path works in Claude Code, on a machine, for someone comfortable with
+a terminal. Analysts work tickets in a chat window. The way to reach them is
+ServiceNow's own MCP Server app, exposed as a connector in claude.ai, with
+OAuth delegated per user so every tool call is audited under the analyst's own
+login.
+
+I verified the prerequisites on the instance (the MCP Server app, its health
+endpoint, the Quickstart server, the Application Registry state), worked out
+the exact OAuth record settings from ServiceNow's reference material and a
+test, and wrote the runbook in [`docs/mcp-connector-guide.md`](docs/mcp-connector-guide.md).
+It covers:
+
+- The three values the Claude connector form needs and where each one comes
+  from in ServiceNow.
+- The settings that must be exact, and the symptom when each one is wrong.
+  Token Format left on the Opaque default connects cleanly and then exposes
+  zero tools, which is the kind of failure that costs an afternoon.
+- Proving the pipe with the read-only Quickstart server before building a
+  tool set.
+- A minimum tool set for a service desk (get and update incident, get and
+  update catalog task) and the roles needed to create it.
+- A hardening checklist: vault the secret, tell the platform owner, replace
+  the broad `useraccount` scope with a custom scope once the tool set
+  settles, treat ticket text reaching the model as untrusted.
+
+Production rollout was gated on two things outside my control: confirming the
+Now Assist licensing that the MCP Server app ships under, and a governance
+decision about company ticket data reaching a third-party AI tenant. Both were
+raised with the right people before anything was connected.
+
+## Lessons that transfer
+
+1. **Per-user OAuth beats a service account every time.** The audit trail
+   stays honest, access follows the person's real roles, and offboarding the
+   person offboards the integration.
+2. **Make the agent name its target.** No default alias, no default instance,
+   no implicit prod. The one time this feels annoying is the one time it
+   matters.
+3. **Separate read from write at the tool level, not the prompt level.** A
+   prompt can be talked out of a rule. A script with no write path cannot.
+4. **Rehearse on a clone, dry-run on prod, then apply with a read-back.**
+   Three gates, each cheap, each catching a different class of mistake.
+5. **Leave decisions to humans and say so in the output.** The asset script
+   created 52 records and refused 34. The refusals, each with a reason, were
+   the most useful part of the report.
+6. **Treat imported ticket text as data, not instructions.** Ticket
+   descriptions, work notes and attachments reach the model. None of it gets
+   to steer the model.
+7. **Expect to look like an attacker.** Credential-manager reads, API bursts
+   and new OAuth clients all trip detections. Tell the security team first.
+8. **Write the quirks down the day you hit them.** The prod callback error
+   page, the elevated-shell credential trap and the invisible journal table
+   each looked like a dead end. Each has a one-line fix. A second person set
+   up the same toolchain from my notes in about an hour.
 
 ## About
 
-Written by [Colin Lundholm](https://github.com/gitColinX) from a working
-deployment. Corrections and additions welcome by issue or pull request.
+Colin Lundholm. Systems administrator and endpoint, identity and cloud
+engineer in Denver. [GitHub profile](https://github.com/gitColinX) ·
+[LinkedIn](https://www.linkedin.com/in/cdlundholm). Corrections welcome by
+issue or pull request. MIT licensed.
