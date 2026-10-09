@@ -1,60 +1,66 @@
 #!/usr/bin/env node
 'use strict'
 /**
- * snow-table-query.js - READ-ONLY ServiceNow Table API list query riding the
- * OAuth aliases stored by `now-sdk auth`. Companion to snow-table-write.js
- * (which reads single records by sys_id and does the writes).
+ * snow-table-query.js: read-only list queries against the ServiceNow Table
+ * API, signed in through an alias stored by `now-sdk auth`.
  *
- * Usage (from repo root so @servicenow packages resolve):
- *   node tools\snow-table-query.js <table> --auth prod [--query "<encoded query>"]
- *        [--fields a,b,c] [--limit 20] [--display true|false|all] [--count]
- *
- * Examples:
- *   node tools\snow-table-query.js change_request --auth prod --query "active=true^state=-3" --fields number,short_description,start_date
- *   node tools\snow-table-query.js cmn_schedule_span --auth prod --query "schedule.type=blackout" --fields schedule,name,start_date_time,end_date_time
- *   node tools\snow-table-query.js sys_user_has_role --auth prod --query "user.user_name=<user>@example.com" --fields role --limit 300
- *
- * Prints JSON: { table, status, total (X-Total-Count), count, rows }. Tokens are never printed.
- * GET only - there is no way to write with this tool.
+ * GET is the only HTTP method in this file. Writes live in snow-table-write.js.
  */
-const { credentialProvider } = require('@servicenow/sdk-cli/dist/auth')
-const { Connector } = require('@servicenow/sdk-api')
+const { UsageError, parseArgs, checkTable, checkWholeNumber, openTarget, tablePath, readBody, runCli } = require('./lib/snow')
 
-function fail(msg) { console.error(JSON.stringify({ ok: false, error: msg })); process.exit(1) }
+const USAGE = `Read-only ServiceNow Table API query.
 
-function parseArgs(argv) {
-    const a = { _: [], limit: '20', display: 'true' }
-    for (let i = 0; i < argv.length; i++) {
-        const k = argv[i]
-        if (k === '--count') a.count = true
-        else if (['--auth', '--query', '--fields', '--limit', '--display', '--offset'].includes(k)) a[k.slice(2)] = argv[++i]
-        else if (k.startsWith('--')) fail(`Unknown flag: ${k}`)
-        else a._.push(k)
-    }
-    return a
-}
+  node tools/snow-table-query.js <table> --auth <alias>
+       [--query "<encoded query>"] [--fields a,b,c] [--limit 20] [--offset 0]
+       [--display true|false|all] [--count]
 
-async function main() {
-    const a = parseArgs(process.argv.slice(2))
-    const table = a._[0]
-    if (!table) fail('First arg must be a table name')
-    if (!a.auth) fail('--auth <alias> is required (for example prod or dev, as stored by now-sdk auth --list)')
-    const connector = new Connector(await credentialProvider(a.auth))
-    const params = new URLSearchParams({
-        sysparm_display_value: a.display,
-        sysparm_exclude_reference_link: 'true',
-        sysparm_limit: a.count ? '1' : a.limit,
+Prints one JSON document: ok, instance, production, table, status, total,
+count, truncated and rows. With --count, only the total.
+`
+
+async function query(argv, deps = {}) {
+    const { positional, flags } = parseArgs(argv, {
+        values: ['auth', 'query', 'fields', 'limit', 'offset', 'display'],
+        switches: ['count'],
     })
-    if (a.query) params.set('sysparm_query', a.query)
-    if (a.fields) params.set('sysparm_fields', a.count ? 'sys_id' : a.fields)
-    if (a.offset) params.set('sysparm_offset', a.offset)
-    const res = await connector.fetch(`/api/now/table/${table}`, { method: 'GET', headers: { Accept: 'application/json' } }, params)
-    const total = res.headers && res.headers.get ? res.headers.get('X-Total-Count') : undefined
-    let body
-    try { body = await res.json() } catch { body = { raw: await res.text() } }
-    if (a.count) console.log(JSON.stringify({ table, status: res.status, total: total != null ? Number(total) : undefined, query: a.query || '' }))
-    else console.log(JSON.stringify({ table, status: res.status, total: total != null ? Number(total) : undefined, count: body.result ? body.result.length : undefined, rows: body.result || body }, null, 1))
-    if (res.status !== 200) process.exit(1)
+    if (positional.length !== 1) throw new UsageError('Give exactly one table name')
+    const table = checkTable(positional[0])
+    const limit = checkWholeNumber(flags.limit ?? '20', '--limit', 1)
+    const offset = checkWholeNumber(flags.offset ?? '0', '--offset')
+    const display = flags.display ?? 'true'
+    if (!['true', 'false', 'all'].includes(display)) throw new UsageError('--display must be true, false or all')
+
+    const target = await openTarget(flags.auth, deps)
+    const params = new URLSearchParams({
+        sysparm_display_value: display,
+        sysparm_exclude_reference_link: 'true',
+        sysparm_limit: flags.count ? '1' : String(limit),
+        sysparm_offset: String(offset),
+    })
+    if (flags.query) params.set('sysparm_query', flags.query)
+    if (flags.count) params.set('sysparm_fields', 'sys_id')
+    else if (flags.fields) params.set('sysparm_fields', flags.fields)
+
+    const res = await target.connector.fetch(tablePath(table), { method: 'GET', headers: { Accept: 'application/json' } }, params)
+    const body = await readBody(res)
+    const header = res.headers.get('X-Total-Count')
+    const total = header === null ? null : Number(header)
+    const ok = res.status === 200
+
+    const output = { ok, instance: target.host, production: target.production, table, status: res.status, total }
+    if (!ok) {
+        output.error = body
+    } else if (flags.count) {
+        output.query = flags.query ?? ''
+    } else {
+        const rows = Array.isArray(body?.result) ? body.result : []
+        output.count = rows.length
+        output.truncated = total === null ? rows.length === limit : offset + rows.length < total
+        output.rows = rows
+    }
+    return { output, exitCode: ok ? 0 : 1 }
 }
 
-main().catch((e) => fail(e.message))
+module.exports = { query, USAGE }
+
+if (require.main === module) runCli(query, USAGE)

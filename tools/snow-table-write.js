@@ -1,171 +1,238 @@
 #!/usr/bin/env node
+'use strict'
 /**
- * snow-table-write.js - authenticated ServiceNow Table API writes (POST/PATCH/GET)
- * reusing the credential aliases already stored by `now-sdk auth` (Windows
- * Credential Manager, per-user). Tokens are never printed.
+ * snow-table-write.js: single-record ServiceNow Table API reads and writes,
+ * signed in through an alias stored by `now-sdk auth`.
  *
- * Usage (run from repository root so @servicenow packages resolve):
- *   node tools\snow-table-write.js get   <table> <sys_id> --auth dev [--fields a,b,c]
- *   node tools\snow-table-write.js post  <table>          --auth dev --data '{"name":"x"}'
- *   node tools\snow-table-write.js patch <table> <sys_id> --auth dev --data '{"name":"y"}'
- *   ... add --data-file payload.json instead of --data for larger payloads.
- *   node tools\snow-table-write.js delete <table> <sys_id> --auth prod --confirm <sys_id>
- *        (guarded: allow-listed link tables only, pre-read + snapshot to _deletions\, verified 404 after)
- *   node tools\snow-table-write.js delete <any_table> <sys_id> --auth dev --confirm <sys_id> --any-table
- *        (dev-only full delete: same snapshot + verify, allow-list bypassed. --any-table is IGNORED on any PROD alias.)
+ * After every post or patch the tool reads the record again with a separate
+ * GET and compares each field it sent with what the record now holds. The
+ * Table API answers 200 even when it silently ignores a misspelled field or a
+ * field a write ACL blocks, so the response to the write is not evidence. The
+ * read-back is. Any difference sets ok:false and exit code 1.
  *
- * --auth is REQUIRED on purpose: no silent fallback to the default alias, so a
- * write can never hit prod unintentionally. Values in --data are raw values
- * (sys_ids for references, choice values not labels). Response prints display
- * values alongside raw values for read-back verification.
+ * Payload values are raw values: sys_ids for references, choice values rather
+ * than labels, UTC date-times.
  */
 const fs = require('fs')
-const { credentialProvider } = require('@servicenow/sdk-cli/dist/auth')
-const { Connector } = require('@servicenow/sdk-api')
+const path = require('path')
+const { UsageError, parseArgs, isSysId, checkTable, checkSysId, openTarget, tablePath, readBody, runCli } = require('./lib/snow')
 
-function fail(msg) {
-    console.error(JSON.stringify({ ok: false, error: msg }))
-    process.exit(1)
-}
+const USAGE = `Single-record ServiceNow Table API writes, each one read back and compared.
 
-function parseArgs(argv) {
-    const args = { _: [] }
-    for (let i = 0; i < argv.length; i++) {
-        const a = argv[i]
-        if (a === '--any-table') {
-            args['any-table'] = true
-        } else if (a === '--auth' || a === '--data' || a === '--data-file' || a === '--fields' || a === '--display-value' || a === '--confirm') {
-            args[a.slice(2)] = argv[++i]
-        } else if (a.startsWith('--')) {
-            fail(`Unknown flag: ${a}`)
-        } else {
-            args._.push(a)
-        }
-    }
-    return args
-}
+  node tools/snow-table-write.js get    <table> <sys_id> --auth <alias> [--fields a,b,c]
+  node tools/snow-table-write.js post   <table>          --auth <alias> --data '<json>'
+  node tools/snow-table-write.js patch  <table> <sys_id> --auth <alias> --data '<json>'
+  node tools/snow-table-write.js delete <table> <sys_id> --auth <alias> --confirm <sys_id>
 
-async function main() {
-    const args = parseArgs(process.argv.slice(2))
-    const [method, table, sysId] = args._
-    if (!method || !['get', 'post', 'patch', 'delete'].includes(method)) fail('First arg must be get|post|patch|delete')
-    if (!table) fail('Second arg must be a table name')
-    if (!args.auth) fail('--auth <alias> is required (e.g. dev, prod, as stored by now-sdk auth --list)')
-    if (method !== 'post' && !sysId) fail(`${method} requires a sys_id as third arg`)
-    if ((method === 'get' || method === 'delete') && (args.data || args['data-file'])) fail(`${method} does not take --data`)
+  --data-file <path>  read the JSON payload from a file instead of --data
+  --confirm-prod      required for any write to an alias that counts as production
+  --any-table         delete outside the allow-list (refused on production)
+`
 
-    if (method === 'delete') return guardedDelete(args, table, sysId)
+// Rows that only link two records together. Deleting one removes a role, a
+// membership or a knowledge access grant, never a business record. On
+// production these are the only tables a delete is allowed on.
+const DELETE_ALLOW_LIST = new Set([
+    'sys_user_has_role',
+    'sys_user_grmember',
+    'sys_group_has_role',
+    'kb_uc_can_read_mtom',
+    'kb_uc_cannot_read_mtom',
+    'kb_uc_can_contribute_mtom',
+    'kb_uc_cannot_contribute_mtom',
+])
 
-    let body
-    if (method !== 'get') {
-        const raw = args['data-file'] ? fs.readFileSync(args['data-file'], 'utf8') : args.data
-        if (!raw) fail(`${method} requires --data '<json>' or --data-file <path>`)
-        try {
-            body = JSON.stringify(JSON.parse(raw))
-        } catch (e) {
-            fail(`--data is not valid JSON: ${e.message}`)
-        }
-    }
+// Journal fields are append-only. Reading one back returns the whole journal,
+// so the check is that the new entry appears in it.
+const JOURNAL_FIELDS = new Set(['work_notes', 'comments'])
 
-    const credential = await credentialProvider(args.auth)
-    const connector = new Connector(credential)
+const READ_HEADERS = { Accept: 'application/json' }
+const WRITE_HEADERS = { 'Content-Type': 'application/json', Accept: 'application/json' }
 
-    const path = sysId ? `/api/now/table/${table}/${sysId}` : `/api/now/table/${table}`
-    const params = new URLSearchParams({
-        sysparm_display_value: args['display-value'] || 'all',
-        sysparm_exclude_reference_link: 'true',
+async function write(argv, deps = {}) {
+    const { positional, flags } = parseArgs(argv, {
+        values: ['auth', 'data', 'data-file', 'fields', 'confirm'],
+        switches: ['confirm-prod', 'any-table'],
     })
-    if (args.fields) params.set('sysparm_fields', args.fields)
+    const [method, table, sysId, ...extra] = positional
+    if (!['get', 'post', 'patch', 'delete'].includes(method)) throw new UsageError('First argument must be get, post, patch or delete')
+    if (extra.length) throw new UsageError(`Unexpected argument: ${extra[0]}`)
+    checkTable(table)
+    if (method === 'post') {
+        if (sysId !== undefined) throw new UsageError('post creates a record, so it takes no sys_id')
+    } else {
+        checkSysId(sysId)
+    }
 
-    const res = await connector.fetch(
-        path,
-        {
-            method: method.toUpperCase(),
-            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            ...(body ? { body } : {}),
-        },
-        params
-    )
+    const sendsPayload = method === 'post' || method === 'patch'
+    if (!sendsPayload && (flags.data || flags['data-file'])) throw new UsageError(`${method} does not take a payload`)
+    if (method !== 'delete' && (flags.confirm || flags['any-table'])) throw new UsageError('--confirm and --any-table only apply to delete')
+    const payload = sendsPayload ? readPayload(flags, deps.readFile) : null
 
-    let payload = null
+    const target = await openTarget(flags.auth, deps)
+    if (method !== 'get' && target.production && !flags['confirm-prod']) {
+        throw new UsageError(
+            `Nothing sent. Alias ${target.alias} resolves to ${target.host}, which counts as production. ` +
+                'Add --confirm-prod if this write is meant for production.'
+        )
+    }
+
+    if (method === 'get') return getRecord(target, table, sysId, flags.fields)
+    if (method === 'delete') return guardedDelete(target, table, sysId, flags, deps)
+    return writeAndVerify(target, method, table, sysId, payload)
+}
+
+function readPayload(flags, readFile = fs.readFileSync) {
+    if (flags.data && flags['data-file']) throw new UsageError('Use --data or --data-file, not both')
+    const text = flags['data-file'] ? readFile(flags['data-file'], 'utf8').replace(/^\uFEFF/, '') : flags.data
+    if (!text) throw new UsageError('post and patch need --data <json> or --data-file <path>')
+    let payload
     try {
-        payload = await res.json()
-    } catch {
-        /* non-JSON body */
+        payload = JSON.parse(text)
+    } catch (err) {
+        throw new UsageError(`The payload is not valid JSON: ${err.message}`)
     }
-    const out = {
-        ok: res.ok,
-        status: res.status,
-        instance: connector.getHost().host,
-        method: method.toUpperCase(),
-        table,
-        result: payload ? (payload.result ?? payload) : null,
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length === 0) {
+        throw new UsageError('The payload must be a JSON object with at least one field')
     }
-    console.log(JSON.stringify(out, null, 2))
-    if (!res.ok) process.exit(1)
+    return payload
+}
+
+const summary = (target, method, table) => ({ instance: target.host, production: target.production, method, table })
+
+async function fetchRecord(connector, table, sysId, { display = 'all', fields } = {}) {
+    const params = new URLSearchParams({ sysparm_display_value: display, sysparm_exclude_reference_link: 'true' })
+    if (fields) params.set('sysparm_fields', fields)
+    const res = await connector.fetch(tablePath(table, sysId), { method: 'GET', headers: READ_HEADERS }, params)
+    const body = await readBody(res)
+    const record = res.status === 200 && body && body.result ? body.result : null
+    return { status: res.status, record, body }
+}
+
+async function getRecord(target, table, sysId, fields) {
+    const got = await fetchRecord(target.connector, table, sysId, { fields })
+    const ok = got.record !== null
+    const output = { ok, ...summary(target, 'GET', table), status: got.status, sys_id: sysId, record: got.record }
+    if (!ok) output.error = got.body
+    return { output, exitCode: ok ? 0 : 1 }
+}
+
+async function writeAndVerify(target, method, table, sysId, payload) {
+    const verb = method.toUpperCase()
+    const params = new URLSearchParams({ sysparm_display_value: 'false', sysparm_exclude_reference_link: 'true', sysparm_fields: 'sys_id' })
+    const res = await target.connector.fetch(tablePath(table, sysId), { method: verb, headers: WRITE_HEADERS, body: JSON.stringify(payload) }, params)
+    const body = await readBody(res)
+    const base = summary(target, verb, table)
+    if (!res.ok) {
+        return { output: { ok: false, ...base, status: res.status, sys_id: sysId ?? null, error: body }, exitCode: 1 }
+    }
+
+    const id = sysId ?? body?.result?.sys_id
+    if (!isSysId(id)) {
+        const error = 'ServiceNow accepted the write but returned no sys_id, so it could not be read back. Check the table by hand.'
+        return { output: { ok: false, ...base, status: res.status, sys_id: null, error }, exitCode: 1 }
+    }
+
+    const fields = [...new Set(['sys_id', 'number', 'sys_updated_on', 'sys_updated_by', ...Object.keys(payload)])].join(',')
+    const after = await fetchRecord(target.connector, table, id, { fields })
+    if (after.record === null) {
+        const error = `The write returned HTTP ${res.status}, but the read-back returned HTTP ${after.status}`
+        return { output: { ok: false, ...base, status: res.status, sys_id: id, verified: false, error, read_back: after.body }, exitCode: 1 }
+    }
+
+    const mismatches = compareFields(payload, after.record)
+    const verified = mismatches.length === 0
+    return { output: { ok: verified, ...base, status: res.status, sys_id: id, verified, mismatches, record: after.record }, exitCode: verified ? 0 : 1 }
+}
+
+const asText = (value) => (value === null || value === undefined ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value))
+
+/** Compare what was sent with a record read back using sysparm_display_value=all. */
+function compareFields(sent, record) {
+    const mismatches = []
+    for (const [field, wanted] of Object.entries(sent)) {
+        const got = record[field]
+        if (got === undefined) {
+            mismatches.push({ field, sent: wanted, problem: 'not in the read-back (unknown field, or no read access)' })
+            continue
+        }
+        const pair = got !== null && typeof got === 'object'
+        const raw = pair ? got.value : got
+        const display = pair ? got.display_value : got
+        if (JOURNAL_FIELDS.has(field)) {
+            const entry = asText(wanted).trim()
+            if (!asText(display).includes(entry) && !asText(raw).includes(entry)) {
+                mismatches.push({ field, sent: wanted, problem: 'new journal entry not found in the read-back' })
+            }
+        } else if (asText(raw) !== asText(wanted)) {
+            mismatches.push({ field, sent: wanted, got: raw, problem: 'value differs after the write' })
+        }
+    }
+    return mismatches
 }
 
 /**
- * Guarded delete. Deletes exactly ONE record and only when every guard passes:
- *   - table must be on the allow-list below (link/assignment rows, never business records)
- *   - --confirm <sys_id> must repeat the sys_id exactly (no copy-paste of the wrong id)
- *   - the record is read first; if it does not exist or the read fails, nothing is deleted
- *   - the pre-delete snapshot is appended to _deletions\<auth>-deletions.jsonl
- *     before the DELETE is sent, so every removal is recoverable via POST of the snapshot
- *   - a read-after-delete must return 404, otherwise exit code 1
+ * Delete exactly one record, and only when every guard passes:
+ *   - --confirm repeats the sys_id exactly
+ *   - the table is on the allow-list, or the target is non-production and
+ *     --any-table was given
+ *   - the record exists and its raw values are appended to a local JSONL log
+ *     before the DELETE is sent, so it can be restored with a POST
+ *   - a read after the delete must return 404, otherwise exit code 1
  */
-const DELETE_ALLOWED_TABLES = new Set([
-    'sys_user_has_role', // direct role assignment rows
-    'sys_user_grmember', // group membership rows
-    'sys_group_has_role', // group role rows
-    'kb_uc_can_read_mtom', 'kb_uc_cannot_read_mtom', 'kb_uc_can_contribute_mtom', 'kb_uc_cannot_contribute_mtom',
-])
-
-// Aliases that point at production. Edit to match your now-sdk auth --list output.
-const PROD_ALIASES = new Set(['prod'])
-
-async function guardedDelete(args, table, sysId) {
-    const isProd = PROD_ALIASES.has(args.auth)
-    if (!DELETE_ALLOWED_TABLES.has(table)) {
-        if (isProd) fail(`delete is not allowed on ${table} in PROD (alias ${args.auth}). Allowed: ${[...DELETE_ALLOWED_TABLES].join(', ')}. --any-table is ignored on prod.`)
-        if (!args['any-table']) fail(`delete on ${table} needs --any-table (non-prod alias ${args.auth} only). Allowed without it: ${[...DELETE_ALLOWED_TABLES].join(', ')}`)
+async function guardedDelete(target, table, sysId, flags, deps = {}) {
+    if (flags.confirm !== sysId) throw new UsageError(`delete needs --confirm ${sysId}, repeating the sys_id exactly`)
+    const listed = DELETE_ALLOW_LIST.has(table)
+    if (!listed && target.production) {
+        throw new UsageError(
+            `Refused. ${table} is not on the delete allow-list, and ${target.host} counts as production, where --any-table is not accepted. ` +
+                `Allowed: ${[...DELETE_ALLOW_LIST].join(', ')}`
+        )
     }
-    if (!/^[0-9a-f]{32}$/.test(sysId)) fail('delete requires a 32-char sys_id')
-    if (args.confirm !== sysId) fail(`delete requires --confirm ${sysId} (must match the sys_id exactly)`)
+    if (!listed && !flags['any-table']) {
+        throw new UsageError(`${table} is not on the delete allow-list. On a non-production instance, add --any-table to delete it anyway.`)
+    }
 
-    const credential = await credentialProvider(args.auth)
-    const connector = new Connector(credential)
-    const host = connector.getHost().host
-    const params = new URLSearchParams({ sysparm_display_value: 'all', sysparm_exclude_reference_link: 'true' })
-    const path = `/api/now/table/${table}/${sysId}`
+    const { connector, host } = target
+    const before = await fetchRecord(connector, table, sysId, { display: 'false' })
+    if (before.status === 404) throw new UsageError(`Nothing deleted: ${table}/${sysId} does not exist on ${host}`)
+    if (before.record === null) throw new UsageError(`Nothing deleted: the pre-read returned HTTP ${before.status}`)
 
-    const pre = await connector.fetch(path, { method: 'GET', headers: { Accept: 'application/json' } }, params)
-    if (pre.status === 404) fail(`nothing deleted: ${table}/${sysId} does not exist on ${host}`)
-    if (!pre.ok) fail(`nothing deleted: pre-read failed with HTTP ${pre.status}`)
-    const snapshot = (await pre.json()).result
+    const log = deletionLog(target.alias, deps.logDir)
+    log.append({ event: 'snapshot', instance: host, table, sys_id: sysId, record: before.record })
 
-    const logDir = require('path').join(process.cwd(), '_deletions')
-    fs.mkdirSync(logDir, { recursive: true })
-    const logFile = `${logDir}\\${args.auth}-deletions.jsonl`
-    fs.appendFileSync(logFile, JSON.stringify({ ts: new Date().toISOString(), instance: host, table, sys_id: sysId, record: snapshot }) + '\n')
+    const del = await connector.fetch(tablePath(table, sysId), { method: 'DELETE', headers: READ_HEADERS })
+    await readBody(del)
+    const after = await fetchRecord(connector, table, sysId, { display: 'false', fields: 'sys_id' })
+    const accepted = del.status === 200 || del.status === 204
+    const gone = after.status === 404
+    log.append({ event: 'delete', instance: host, table, sys_id: sysId, delete_status: del.status, verified_gone: gone })
 
-    const del = await connector.fetch(path, { method: 'DELETE', headers: { Accept: 'application/json' } })
-    const post = await connector.fetch(path, { method: 'GET', headers: { Accept: 'application/json' } }, params)
-    const gone = post.status === 404
-    const out = {
-        ok: (del.status === 204 || del.status === 200) && gone,
+    const ok = accepted && gone
+    const output = {
+        ok,
+        ...summary(target, 'DELETE', table),
         status: del.status,
-        instance: host,
-        method: 'DELETE',
-        table,
         sys_id: sysId,
-        mode: DELETE_ALLOWED_TABLES.has(table) ? 'guarded' : 'full (non-prod, --any-table)',
+        mode: listed ? 'allow-listed table' : 'any table (non-production)',
         verified_gone: gone,
-        snapshot_logged_to: logFile,
-        deleted_record: snapshot,
+        snapshot_log: log.file,
+        deleted_record: before.record,
     }
-    console.log(JSON.stringify(out, null, 2))
-    if (!out.ok) process.exit(1)
+    return { output, exitCode: ok ? 0 : 1 }
 }
 
-main().catch((e) => fail(e.message))
+function deletionLog(alias, dir = path.join(process.cwd(), '_deletions')) {
+    const file = path.join(dir, `${alias.replace(/[^A-Za-z0-9_.-]/g, '_')}-deletions.jsonl`)
+    return {
+        file,
+        append(entry) {
+            fs.mkdirSync(dir, { recursive: true })
+            fs.appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n')
+        },
+    }
+}
+
+module.exports = { write, compareFields, DELETE_ALLOW_LIST, USAGE }
+
+if (require.main === module) runCli(write, USAGE)

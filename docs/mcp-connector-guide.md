@@ -5,11 +5,13 @@ native MCP (Model Context Protocol) Server, with OAuth delegated per user, so
 Claude can read and update tickets as the signed-in analyst and every action
 lands in the ServiceNow audit trail under that person's name.
 
-This is the sanitized runbook I wrote in September 2026 for standing this up on
-a production ServiceNow instance (Zurich release), after verifying the
-prerequisites and the OAuth record settings on that instance. Instance names,
-people, ticket numbers and internal references are removed. The story around
-it, including the ServiceNow SDK path that was already in daily use, is in the
+This is a rewrite, for publication, of the runbook I wrote in September 2026
+while preparing to stand this up on a production ServiceNow instance (Zurich
+release). I checked that instance's Application Registry and worked out the
+OAuth record settings from ServiceNow's reference material; the connector
+itself stayed at the runbook stage. Instance names, people, ticket numbers and
+internal references are removed. The story around it, including the
+ServiceNow SDK path that was already in daily use, is in the
 [repository README](../README.md).
 
 ```
@@ -34,7 +36,9 @@ claude.ai  --MCP over HTTPS------------------->  /sncapps/mcp-server/mcp/<server
 
 | Requirement | Notes |
 |---|---|
-| ServiceNow Zurich Patch 4 or later | Earlier releases do not ship the MCP Server app |
+| ServiceNow Zurich or later, at the patch level on ServiceNow's current MCP Server prerequisite list | Older patch levels do not offer the MCP Server app. The minimum patch has moved between releases, so check ServiceNow's current list rather than a number in a runbook |
+| AI Agents store app 6.x or later | On ServiceNow's published prerequisite list for the MCP Server |
+| MCP Client store app 1.1 or later | Same list |
 | Now Assist licensing (Pro Plus / Enterprise Plus) or an AI SKU | The MCP Server app is not part of base ITSM. If it does not appear under All Available Applications, that is a licensing question for your account team, not a permissions problem |
 | `Now Assist Admin Console` (sn_nowassist_admin) installed | Dependency of the MCP server app |
 | `Model Context Protocol Server` (sn_mcp_server) installed | Provides the MCP Server Console, the Quickstart server, and the `/sncapps/mcp-server/` endpoints |
@@ -248,6 +252,10 @@ token itself is broad.
 
 Before the first write against a real ticket:
 
+- [ ] Get a decision from whoever owns data governance on which ticket data
+      and ticket tools the connector may open to analysts' Claude chats, in
+      the organization's managed Claude tenant only. That is a policy
+      question, not an admin setting.
 - [ ] Tell the ServiceNow platform owner the connector exists and where the
       registry record is.
 - [ ] Put the Client Secret in the team password vault, labeled with the
@@ -269,12 +277,13 @@ Once the tool set is settled:
 
 claude.ai web chat can only reach ServiceNow through a connector like the one
 above. Claude Code (terminal or desktop app) can instead use the ServiceNow
-SDK's own OAuth login and small local scripts. I used both, for different
-jobs: the MCP connector for analysts working tickets in chat, and the SDK path
-for admin work like Change Advisory Board prep and offboarding audits.
+SDK's own OAuth login and small local scripts. I designed both, for different
+jobs: the MCP connector for analysts working tickets in chat (this runbook;
+not connected yet), and the SDK path, which I used daily for admin work like
+Change Advisory Board prep and offboarding audits.
 
 ```powershell
-npm install @servicenow/sdk-cli @servicenow/sdk-api
+npm install @servicenow/sdk@4.11.2    # provides the now-sdk command
 npx now-sdk auth --add https://<dev-instance>.service-now.com  --type oauth --alias dev
 npx now-sdk auth --add https://<prod-instance>.service-now.com --type oauth --alias prod
 npx now-sdk auth --list
@@ -284,20 +293,29 @@ Lessons from that path:
 
 - Use `--type oauth`, never `--type basic`. Under SSO your ServiceNow password
   is not what you type into Windows, so basic auth fails.
-- Add the alias from a normal, non-elevated shell as your everyday account.
-  The credential is stored per Windows user, and Claude Code runs as you.
-- On some instances the OAuth callback lands on a "Security constraints
-  prevent access to requested page" error. That is expected. Copy the `code=`
-  value from the address bar and paste it into the terminal.
+- Add the alias from a normal shell as your everyday account, not from a shell
+  running as a separate admin account. The credential is stored per Windows
+  user, and Claude Code runs as you.
+- On some instances the OAuth callback page, which normally displays the
+  one-time code, shows a "Security constraints prevent access to requested
+  page" error after sign-in and consent have already succeeded. The code is
+  still in the address bar. Copy the `code=` value and paste it into the
+  terminal, which is the step the SDK login asks for anyway.
 - Give Claude two scripts, not one: a **read-only query tool** (GET only, no
   way to write) and a **write tool** that requires an explicit `--auth <alias>`
   on every call, so nothing can fall through to prod by default, and that reads
-  the record back after writing so the output is evidence rather than a claim.
+  the record back after writing and compares it with what was sent, so the
+  output is evidence rather than a claim. The repository's `tools/` folder has
+  both.
 - Rehearse anything bulk or unusual against a dev clone first.
 - `sys_journal_field` can return zero rows with no error through the SDK
   account. Read work notes and comments from the task record instead.
 
 ## About
 
-Written by [Colin Lundholm](https://github.com/gitColinX) from a working
-deployment. Corrections and additions welcome by issue or pull request.
+Colin Lundholm, IT Support Engineer, working across systems administration,
+endpoint, identity and cloud · [GitHub profile](https://github.com/gitColinX) ·
+[LinkedIn](https://www.linkedin.com/in/cdlundholm)
+
+Written while preparing a production rollout. Corrections and additions
+welcome by issue or pull request.
