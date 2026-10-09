@@ -12,7 +12,7 @@ OAuth record settings from ServiceNow's reference material; the connector
 itself stayed at the runbook stage. Instance names, people, ticket numbers and
 internal references are removed. The story around it, including the
 ServiceNow SDK path that was already in daily use, is in the
-[repository README](../README.md).
+[full write-up](WRITEUP.md).
 
 ```
 claude.ai  --OAuth (Authorization Code, JWT)-->  ServiceNow Application Registry
