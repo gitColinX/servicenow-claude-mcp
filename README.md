@@ -97,7 +97,8 @@ would eventually hurt someone.
 
 ### What broke, and what I learned
 
-- **Basic auth failed immediately.** The company logged into ServiceNow
+- **Basic auth failed immediately.** My first command on day one was
+  `now-sdk auth --add <prod> --type basic`. The company logged into ServiceNow
   through Entra ID SSO, so there was no ServiceNow password to type. Fix:
   `--type oauth`, always.
 - **The prod OAuth callback landed on an error page.** "Security constraints
@@ -158,7 +159,9 @@ The SDK path works in Claude Code, on a machine, for someone comfortable with
 a terminal. Analysts work tickets in a chat window. The way to reach them is
 ServiceNow's own MCP Server app, exposed as a connector in claude.ai, with
 OAuth delegated per user so every tool call is audited under the analyst's own
-login.
+login. MCP itself was not new to me by then: Claude Code had been running an
+AWS MCP server for WorkSpaces cleanup since July, and claude.ai connectors
+were already part of the daily toolkit.
 
 I verified the prerequisites on the instance (the MCP Server app, its health
 endpoint, the Quickstart server, the Application Registry state), worked out
